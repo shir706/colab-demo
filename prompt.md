@@ -1,24 +1,80 @@
-Write a complete Google Colab notebook using Python and LangGraph to build an order management system for a bakery.
+# Club Chatbot — Technical Specification for Codex
 
-Technical Requirements:
-- Strictly use deterministic Python. NO LLM calls (no API keys needed).
-- Draw the graph using `draw_mermaid_png()`.
-- Input is a dict with: {"item": str, "quantity": int, "day": str, "city": str}
-- Output must contain these exact keys: 'status' ("accepted" or "rejected"), 'product_actually_sold', 'delivery' ("pickup" or "delivery"), 'total' (final price with delivery), 'message' (warm, hard-coded string reply), and 'steps' (a list tracking every node visited).
+Build a Google Colab notebook (`.ipynb`) implementing a topic-locked LangGraph chatbot backed by a Supabase PostgreSQL checkpointer and a Gradio (`gr.Blocks`) interface.
 
-Menu & Inventory State (Hardcode these dicts):
-- prices: challah: 18, babka: 45, rugelach: 30, sourdough: 25
-- inventory: challah: 10, babka: 0, rugelach: 3, sourdough: 4
+## 1. Installation & Secrets
+- Cell 1: Install packages using:
+  `!pip -q install langgraph langchain langchain-openai langgraph-checkpoint-postgres "psycopg[binary]" gradio`
+- Cell 2: Load both secrets from Google Colab Secrets using `google.colab.userdata.get`:
+  - `os.environ["OPENAI_API_KEY"] = userdata.get("OPENAI_API_KEY")`
+  - `SUPABASE_DB_URL = userdata.get("SUPABASE_DB_URL")`
+  - Never hardcode any API key, password, or database URI.
 
-Graph Nodes & Logic:
-1. State: Define a TypedDict including all input and output fields. Initialize 'steps' as an empty list.
-2. Node 1 - `validate_order`: If quantity <= 0 or item not in menu, set status="rejected", message="Politely: couldn't understand order". Else status="accepted", product_actually_sold=item. Append "validate_order" to 'steps'.
-3. Node 2 - `inventory_and_subs` (Runs if accepted): Check if enough inventory for 'product_actually_sold'. If not, try max 2 substitutions in this exact order: babka -> rugelach -> sourdough -> challah. Substitution is valid ONLY if there is enough inventory for the FULL requested quantity. Update 'product_actually_sold'. If 2 suggestions fail or no stock for the full quantity, set status="rejected", message="Apologize, out of stock and cancelling order". Append "inventory_and_subs" to 'steps'.
-4. Node 3 - `delivery_calc` (Runs if accepted): If city == "Jerusalem", delivery="delivery", delivery_fee=20. Else (or if city is empty), delivery="pickup", delivery_fee=0. Append "delivery_calc" to 'steps'.
-5. Node 4 - `discount_calc` (Runs if accepted): Calculate base total (quantity * price of product_actually_sold). If base total > 150 AND day != "Friday", apply a 15% discount to the base total only. Set 'total' = (discounted base total) + delivery_fee. Append "discount_calc" to 'steps'.
-6. Node 5 - `format_reply` (Runs if accepted): Generate a warm, hard-coded response string for 'message' confirming the final order details, substitutions (if any), and delivery method. Append "format_reply" to 'steps'.
+## 2. Model Choice
+- Use `init_chat_model("openai:gpt-4o-mini", temperature=0)` (chosen as a fast, low-cost OpenAI text model suitable for topic-locked Q&A). Keep the model name in a single constant `MODEL_NAME = "openai:gpt-4o-mini"` at the top of the cell.
 
-Edges:
-Create a graph starting at 'validate_order'. Use conditional edges after 'validate_order' and 'inventory_and_subs' to route to END if status == "rejected". Otherwise, flow sequentially through the nodes.
+## 3. LangGraph State, Node & Graph
+- **Topics**: `["Astronomy", "Cooking", "Football", "World Geography", "Python Programming"]`
+- **State (`ChatState`)**:
+  - `messages`: `Annotated[list[AnyMessage], add_messages]`
+  - `topic`: `str` (no reducer, so each new value replaces the previous one)
+- **Single Node (`chatbot`)**:
+  - Exactly one LLM call per user message.
+  - Dynamically construct a `SystemMessage` from `state["topic"]` on every call. Do **not** store the `SystemMessage` in `state["messages"]`.
+  - System message rules:
+    - You are a helpful assistant for the `{topic}` club at Curious Minds.
+    - Answer **only** questions strictly related to `{topic}`.
+    - Politely refuse any off-topic question, explicitly mention that we are currently in the `{topic}` club, and suggest switching to another club from the dropdown (Astronomy, Cooking, Football, World Geography, Python Programming).
+    - If the user asks a follow-up question about a previous topic that appears earlier in the conversation history, you **must** refuse it and remind them that we are now in the `{topic}` club.
+  - Invoke the model with `[system_msg] + state["messages"]` and return `{"messages": [reply]}`.
+- **Graph**: `START -> chatbot -> END`.
 
-Finally, compile the graph and write Python code at the bottom of the notebook to run invoke() on 6 different test cases (including one normal, one rejected due to invalid input, one requiring substitution, one cancelled due to no subs, one with discount, one outside Jerusalem). Print the results beautifully.
+## 4. Supabase Checkpointer (PostgresSaver)
+- Connect using `psycopg` and `PostgresSaver` (no `InMemorySaver`, no in-memory Python dict storing conversations):
+```python
+import psycopg
+from psycopg.rows import dict_row
+from langgraph.checkpoint.postgres import PostgresSaver
+
+conn = psycopg.connect(
+    userdata.get("SUPABASE_DB_URL"),
+    autocommit=True,
+    row_factory=dict_row,
+    prepare_threshold=0,
+)
+checkpointer = PostgresSaver(conn)
+checkpointer.setup()
+graph = builder.compile(checkpointer=checkpointer)
+
+Draw the graph in a dedicated cell using display(Image(graph.get_graph().draw_mermaid_png())).
+
+5. Standalone Test Cell (Before Gradio)
+Include a test cell that runs the graph directly without Gradio:
+
+from langchain_core.messages import HumanMessage
+
+config = {"configurable": {"thread_id": "test-1"}}
+
+def ask(text, topic):
+    result = graph.invoke({"messages": [HumanMessage(text)], "topic": topic}, config)
+    print(f"[{topic}] {text}\n -> {result['messages'][-1].content}\n")
+
+ask("How do I make pancakes?", "Cooking")
+ask("Who won the 2022 World Cup?", "Cooking")
+ask("Who won the 2022 World Cup?", "Football")
+ask("And how long do I fry each pancake?", "Football")
+graph.get_state(config).values
+
+6. Gradio Interface (gr.Blocks)
+Build a clean Gradio web interface with:
+
+A Club / Topic dropdown (gr.Dropdown) with the 5 clubs. Changing the topic continues the same thread_id, and subsequent messages follow only the new topic.
+
+A Saved Conversations dropdown (gr.Dropdown) populated directly by querying the Supabase checkpoints table (e.g., distinct thread_id values) and reading each thread's state via graph.get_state({"configurable": {"thread_id": tid}}).values. Display human-readable labels like "{topic} — {first_30_chars_of_first_user_message}" (mapped to the thread_id), not raw UUIDs. Selecting a saved conversation loads both its messages and its saved topic into the UI, and new messages continue that thread.
+
+A + New conversation button (gr.Button) that generates a new str(uuid.uuid4()) as the active thread_id and clears the chat window.
+
+A Chat window (gr.Chatbot) and Message input (gr.Textbox) that sends only the new user message and current topic to graph.invoke(...) with the active thread_id, then refreshes the chat and saved conversations list.
+
+Keep the code clean and divided into clear notebook cells.
+
